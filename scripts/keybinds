@@ -11,15 +11,33 @@
 # produced we fall back to parsing `hyprctl binds` directly.
 
 set -uo pipefail
+export LC_ALL=C
 
 cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy"
+max_bytes=$(( 1024 * 1024 ))   # refuse a cache file larger than this
+max_records=4000               # and never emit more lines than this
+
+# Newest regular, non-symlink cache file, or nothing. The final open uses
+# O_NOFOLLOW (dd iflag=nofollow) so a link swapped in after the check is
+# refused as well.
+newest_cache_file() {
+  local candidate
+  for candidate in $(ls -t "$cache_dir"/keybindings-*.records 2>/dev/null); do
+    [[ -L $candidate ]] && continue
+    [[ -f $candidate ]] || continue
+    printf '%s\n' "$candidate"
+    return 0
+  done
+  return 1
+}
 
 emit_from_cache() {
-  local records
+  local records size
   omarchy-menu-keybindings --print >/dev/null 2>&1 || true
-  records=$(ls -t "$cache_dir"/keybindings-*.records 2>/dev/null | head -n 1)
-  [[ -s $records ]] || return 1
-  awk -F'\t' '
+  records=$(newest_cache_file) || return 1
+  size=$(stat -c %s -- "$records" 2>/dev/null) || return 1
+  (( size > 0 && size <= max_bytes )) || return 1
+  dd if="$records" iflag=nofollow bs=4096 status=none 2>/dev/null | head -c "$max_bytes" | awk -F'\t' '
     {
       display = $1
       split_at = index(display, " → ")
@@ -30,7 +48,7 @@ emit_from_cache() {
       arg = ""
       for (i = 3; i <= NF; i++) arg = arg (i > 3 ? "\t" : "") $i
       printf "bind\t%s\t%s\t%s\t%s\n", combo, desc, $2, arg
-    }' "$records"
+    }' | head -n "$max_records"
 }
 
 modmask_to_text() {
@@ -62,7 +80,7 @@ emit_from_hyprctl() {
   done
 }
 
-emit_from_cache || emit_from_hyprctl
+emit_from_cache || emit_from_hyprctl | head -n "$max_records"
 
 for kind in terminal browser editor; do
   value=$("omarchy-default-$kind" 2>/dev/null || true)

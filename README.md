@@ -118,12 +118,31 @@ BarWidget.qml     the bar button (same as the built-in one)
 MenuModel.js      menu parsing and search, from Omarchy's menu plugin
 Keybinds.js       maps Hyprland binds onto menu items and desktop entries
 scripts/keybinds  emits the bind records (reuses omarchy-menu-keybindings' cache)
+scripts/read-file bounded, symlink-refusing reader for the menu JSONC files
 scripts/status    theme and version for the header
 scripts/updates   pending update count for the header
 scripts/toggle    enable ⇄ disable
 scripts/enabled   exit 0 when Switchboard is active (for `checked:` guards)
 extension/        the Trigger › Toggle entry above
 ```
+
+## Input bounds
+
+Everything the launcher parses is produced by something else — helper
+scripts, `provider:` commands, `when:` / `checked:` guard batches, and the
+two `omarchy-menu.jsonc` files — so all of it goes through the same limits
+(top of `Switchboard.qml`, `maxProcess*` / `maxMenuFileBytes` /
+`*TimeoutMs`):
+
+- Process output is kept line by line up to 256K characters / 4000 lines;
+  past either the producer is killed and its output discarded.
+- Every producer has a deadline (10s providers and guards, 15s helpers,
+  2min for the update check) after which it is killed.
+- Menu files are read by `scripts/read-file`, which refuses symlinks,
+  non-regular files, and anything over 1 MiB, and opens with `O_NOFOLLOW`.
+  The QML only watches those paths for changes; it never reads them itself.
+- The keybinding cache is picked the same way: newest regular non-symlink
+  file, size-checked, opened with `O_NOFOLLOW`, output capped.
 
 ## Hacking
 

@@ -51,8 +51,8 @@ Item {
   }
 
   function refresh() {
-    defaultMenuFile.reload()
-    userMenuFile.reload()
+    root.loadMenuFile(defaultMenuProc, root.defaultMenuPath)
+    root.loadMenuFile(userMenuProc, root.userMenuPath)
     root.loadKeybinds(true)
     root.loadStatus()
     return "ok"
@@ -63,6 +63,17 @@ Item {
   // ---------------------------------------------------------------- tunables
 
   readonly property int keybindRefreshSeconds: 30
+
+  // Input bounds. Everything the launcher parses comes from a helper script,
+  // a provider, a guard batch, or a menu file — all producer-controlled — so
+  // nothing is retained past these caps and no producer can hold the shell.
+  readonly property int maxProcessChars: 256 * 1024   // per process output (UTF-16 units; ≤ 1 MiB of UTF-8)
+  readonly property int maxProcessRecords: 4000       // lines kept per process
+  readonly property int maxMenuFileBytes: 1024 * 1024 // per omarchy-menu.jsonc
+  readonly property int providerTimeoutMs: 10 * 1000
+  readonly property int guardTimeoutMs: 10 * 1000
+  readonly property int helperTimeoutMs: 15 * 1000
+  readonly property int updatesTimeoutMs: 120 * 1000
   readonly property int updateCheckMinutes: 30
 
   // ------------------------------------------------------------------- state
@@ -308,7 +319,6 @@ Item {
     providerProc.menuId = id
     providerProc.providerKey = entry.provider
     providerProc.revision = root.providerRevision
-    providerProc.collected = ""
     providerProc.command = ["bash", "-lc", spec.script]
     providerProc.running = true
   }
@@ -968,20 +978,68 @@ Item {
 
   // -------------------------------------------------------------- processes
 
-  Process {
+  // Every producer runs through this. Output is kept line by line only up to
+  // maxProcessChars / maxProcessRecords; past either cap the producer is
+  // killed and its output dropped. A deadline kills producers that never
+  // exit. Consumers read `collected` only when `ok` is true.
+  component BoundedProcess: Process {
+    id: proc
+    property int deadlineMs: root.helperTimeoutMs
+    property string collected: ""
+    property int records: 0
+    property bool overflow: false
+    property bool timedOut: false
+    readonly property bool ok: !overflow && !timedOut
+
+    stdout: SplitParser {
+      onRead: function(data) {
+        if (proc.overflow || proc.timedOut) return
+        if (proc.records >= root.maxProcessRecords || proc.collected.length + data.length + 1 > root.maxProcessChars) {
+          proc.overflow = true
+          proc.collected = ""
+          proc.running = false
+          return
+        }
+        proc.collected += data + "\n"
+        proc.records += 1
+      }
+    }
+
+    onRunningChanged: {
+      if (running) {
+        collected = ""
+        records = 0
+        overflow = false
+        timedOut = false
+        deadline.restart()
+      } else {
+        deadline.stop()
+      }
+    }
+
+    // A typed property rather than a child: Process has no default property.
+    property Timer deadline: Timer {
+      interval: proc.deadlineMs
+      onTriggered: {
+        proc.timedOut = true
+        proc.collected = ""
+        proc.running = false
+      }
+    }
+  }
+
+  BoundedProcess {
     id: providerProc
+    deadlineMs: root.providerTimeoutMs
     property string menuId: ""
     property string providerKey: ""
-    property string collected: ""
     property int revision: 0
-    stdout: SplitParser {
-      onRead: function(data) { providerProc.collected += data + "\n" }
-    }
     onExited: {
-      if (providerProc.revision === root.providerRevision) {
+      if (providerProc.ok && providerProc.revision === root.providerRevision) {
         root.mergeProviderRows(providerProc.collected, providerProc.menuId, providerProc.providerKey)
         if (root.filterText.trim()) root.loadProvidersForSearch()
       }
+      providerProc.collected = ""
       root.startNextProvider()
     }
   }
@@ -994,37 +1052,70 @@ Item {
     }
   }
 
-  Process {
+  BoundedProcess {
     id: keybindsProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: root.applyKeybinds(text)
+    onExited: {
+      if (keybindsProc.ok) root.applyKeybinds(keybindsProc.collected)
+      keybindsProc.collected = ""
     }
   }
 
-  Process {
+  BoundedProcess {
     id: statusProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var lines = String(text || "").split("\n")
-        for (var i = 0; i < lines.length; i++) {
-          var parts = lines[i].split("\t")
-          if (parts[0] === "theme") root.themeName = String(parts[1] || "").trim()
-          else if (parts[0] === "version") root.versionText = String(parts[1] || "").trim()
-        }
+    onExited: {
+      if (!statusProc.ok) return
+      var lines = statusProc.collected.split("\n")
+      statusProc.collected = ""
+      for (var i = 0; i < lines.length; i++) {
+        var parts = lines[i].split("\t")
+        if (parts[0] === "theme") root.themeName = String(parts[1] || "").trim().slice(0, 80)
+        else if (parts[0] === "version") root.versionText = String(parts[1] || "").trim().slice(0, 40)
       }
     }
   }
 
-  Process {
+  BoundedProcess {
     id: updatesProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var n = parseInt(String(text || "").trim(), 10)
-        root.updateCount = isFinite(n) ? n : 0
-      }
+    deadlineMs: root.updatesTimeoutMs
+    onExited: {
+      if (!updatesProc.ok) return
+      var n = parseInt(updatesProc.collected.trim(), 10)
+      updatesProc.collected = ""
+      root.updateCount = isFinite(n) && n >= 0 ? Math.min(n, 9999) : 0
+    }
+  }
+
+  // Menu definitions are read through scripts/read-file, which refuses
+  // symlinks, non-regular files, and anything over maxMenuFileBytes, and
+  // opens with O_NOFOLLOW. The FileViews below only watch for changes; they
+  // never load the file themselves (preload: false).
+  function loadMenuFile(proc, path) {
+    if (!root.pluginDir || !path) return
+    if (proc.running) { proc.reloadPending = true; return }
+    proc.reloadPending = false
+    proc.command = [root.pluginDir + "/scripts/read-file", path, String(root.maxMenuFileBytes)]
+    proc.running = true
+  }
+
+  BoundedProcess {
+    id: defaultMenuProc
+    property bool reloadPending: false
+    onExited: function(exitCode) {
+      root.defaultMenuItems = (defaultMenuProc.ok && exitCode === 0) ? root.parseMenuJsonc(defaultMenuProc.collected) : []
+      defaultMenuProc.collected = ""
+      root.rebuildItemsFromSources()
+      if (defaultMenuProc.reloadPending) Qt.callLater(function() { root.loadMenuFile(defaultMenuProc, root.defaultMenuPath) })
+    }
+  }
+
+  BoundedProcess {
+    id: userMenuProc
+    property bool reloadPending: false
+    onExited: function(exitCode) {
+      root.userMenuItems = (userMenuProc.ok && exitCode === 0) ? root.parseMenuJsonc(userMenuProc.collected) : []
+      userMenuProc.collected = ""
+      root.rebuildItemsFromSources()
+      if (userMenuProc.reloadPending) Qt.callLater(function() { root.loadMenuFile(userMenuProc, root.userMenuPath) })
     }
   }
 
@@ -1059,6 +1150,8 @@ Item {
     id: bootTimer
     interval: 250
     onTriggered: {
+      root.loadMenuFile(defaultMenuProc, root.defaultMenuPath)
+      root.loadMenuFile(userMenuProc, root.userMenuPath)
       root.loadKeybinds(true)
       root.loadStatus()
     }
@@ -1079,22 +1172,21 @@ Item {
   }
 
   FileView {
-    id: defaultMenuFile
+    id: defaultMenuWatch
     path: root.defaultMenuPath
+    preload: false
     watchChanges: true
     printErrors: false
-    onLoaded: { root.defaultMenuItems = root.parseMenuJsonc(text()); root.rebuildItemsFromSources() }
-    onFileChanged: reload()
+    onFileChanged: root.loadMenuFile(defaultMenuProc, root.defaultMenuPath)
   }
 
   FileView {
-    id: userMenuFile
+    id: userMenuWatch
     path: root.userMenuPath
+    preload: false
     watchChanges: true
     printErrors: false
-    onLoaded: { root.userMenuItems = root.parseMenuJsonc(text()); root.rebuildItemsFromSources() }
-    onLoadFailed: { root.userMenuItems = []; root.rebuildItemsFromSources() }
-    onFileChanged: reload()
+    onFileChanged: root.loadMenuFile(userMenuProc, root.userMenuPath)
   }
 
   // ------------------------------------------------------------------ guards
@@ -1119,19 +1211,16 @@ Item {
       root.checkedResults = ({})
       return
     }
-    guardProc.collected = ""
     guardProc.command = ["bash", "-lc", script]
     guardProc.running = true
   }
 
-  Process {
+  BoundedProcess {
     id: guardProc
-    property string collected: ""
-    stdout: SplitParser {
-      onRead: function(data) { guardProc.collected += data + "\n" }
-    }
+    deadlineMs: root.guardTimeoutMs
     onExited: function(exitCode, exitStatus) {
-      if (exitCode !== 0 || exitStatus !== 0) {
+      if (!guardProc.ok || exitCode !== 0 || exitStatus !== 0) {
+        guardProc.collected = ""
         if (root.guardsPending) Qt.callLater(function() { root.evaluateGuards() })
         return
       }
@@ -1139,6 +1228,7 @@ Item {
       var nextWhen = ({})
       var nextChecked = ({})
       var lines = guardProc.collected.split("\n")
+      guardProc.collected = ""
       for (var i = 0; i < lines.length; i++) {
         var line = lines[i].trim()
         if (!line) continue
