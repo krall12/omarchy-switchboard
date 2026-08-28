@@ -22,8 +22,13 @@ click, and `omarchy menu` call opens Switchboard instead of the built-in
 menu. Turn it off and you're back, keybindings untouched:
 
 ```bash
-omarchy plugin disable krall.switchboard
+omarchy plugin disable krall.switchboard   # back to the built-in menu
+omarchy plugin remove krall.switchboard    # gone entirely
 ```
+
+Everything it needs ships with Omarchy: `jq`, `hyprctl`, `xdg-open`,
+`xdg-terminal-exec`, and the `omarchy-*` helper scripts. No install hooks,
+no sudo, no network, nothing written outside the plugin directory.
 
 ## What it does
 
