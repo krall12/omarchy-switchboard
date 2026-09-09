@@ -29,7 +29,13 @@ Item {
   property string omarchyPath: Quickshell.env("OMARCHY_PATH")
   property var shell: null
   property var manifest: null
-  readonly property string pluginDir: manifest && manifest.__sourceDir ? String(manifest.__sourceDir) : ""
+  // Omarchy 4.0.3 strips __sourceDir from third-party manifests
+  // (shell.qml publicPluginManifest), so fall back to this file's own
+  // location. Without a pluginDir, loadMenuFile/loadKeybinds bail out and
+  // the panel never becomes visible (visible: opened && rowsLoaded).
+  readonly property string pluginDir: manifest && manifest.__sourceDir
+    ? String(manifest.__sourceDir)
+    : String(Qt.resolvedUrl(".")).replace(/^file:\/\//, "").replace(/\/$/, "")
 
   // --------------------------------------------------------------- lifecycle
 
