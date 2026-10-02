@@ -73,6 +73,43 @@ answers the `select` / `input` requests that `omarchy menu select` and other
 scripts send. Theme colors, fonts, radius and spacing all come from the
 theme's `[menu]` tokens, so every theme already styles it.
 
+## Launcher size and position
+
+Set `scale` on Switchboard's existing bar layout entry in
+`~/.config/omarchy/shell.json`, keeping its current section and position:
+
+```json
+{ "id": "krall.switchboard", "scale": 1.2 }
+```
+
+`1.2` makes the launcher approximately 20% larger, including text, icons,
+spacing, tiles, and card width. It leaves the bar button and other shell panels
+unchanged. Omit `scale` or use `1` for the original size. Numeric values are
+limited to `0.75`–`2`; invalid values fall back to `1`.
+
+The setting applies live by watching the same `shell.json` and reading it
+through the launcher's existing bounded file helper. There is
+no separate Switchboard configuration file. Existing theme sizes remain the
+base; the card still fits within the screen and long menus scroll. With no bar
+entry, the original size is used. Restart the shell once after installing this
+version so its new JavaScript module is loaded; subsequent scale changes apply live.
+
+To center the card vertically when it opens, add
+`verticalAlignment: "center"` to the same entry:
+
+```json
+{ "id": "krall.switchboard", "scale": 1.2, "verticalAlignment": "center" }
+```
+
+Omit `verticalAlignment` or use `"top"` to preserve the original fixed upper
+position. On compact screens, the upper offset shrinks only when needed to
+leave room for the controls and one complete row. Centered mode captures the
+initial top edge, then keeps the search field and
+first result stationary while typing or navigating submenus. Results expand
+downward and scroll when they reach the bottom of the screen. Closing and
+reopening centers the launcher again. A display or scale-setting change also
+repositions it. The setting applies live and covers select/input dialogs.
+
 ## Keys
 
 | Key | Menu | `select` / `input` |
@@ -155,8 +192,21 @@ tail -f /run/user/$UID/quickshell/by-pid/*/log.log
 ```
 
 The knobs are at the top of `Switchboard.qml`: tile height and gap, card
-width, and `cardTop` (where the card hangs from — the same distance is kept
-below it, so a full launcher sits centred).
+width, and the original 20% top offset in the surface section. Prefer the
+`scale` and `verticalAlignment` settings above for user configuration.
+
+Run the configuration tests with `node tests/ui-scale.cjs` (Node.js is needed
+only for tests). For runtime checks, use
+`omarchy-shell shell call krall.switchboard scaleInfo ""`.
+
+For the integration display matrix, run `python tests/display-matrix.py` from
+an active Hyprland session with Omarchy, Quickshell, and grim installed. It
+creates an isolated launcher with temporary configuration on a temporary
+headless output, checks actual QML geometry, and removes the output afterward.
+Physical monitor modes and your shell.json are not changed. Results and selected
+screenshots are written to `/tmp/switchboard-matrix-results` (override with
+`SWITCHBOARD_TEST_ARTIFACTS`). See [the display test report](tests/display-matrix-results.md)
+for coverage and limitations.
 
 ## License
 
